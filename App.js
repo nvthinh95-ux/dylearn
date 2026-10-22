@@ -1,8 +1,9 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import {
   View, Text, TextInput, TouchableOpacity, Image, ScrollView,
-  ActivityIndicator, Alert, StyleSheet, SafeAreaView, StatusBar, Platform,
+  ActivityIndicator, Alert, StyleSheet, SafeAreaView, StatusBar, Platform, Modal,
 } from 'react-native';
+import { WebView } from 'react-native-webview';
 import * as Clipboard from 'expo-clipboard';
 import * as FileSystem from 'expo-file-system';
 import * as MediaLibrary from 'expo-media-library';
@@ -58,12 +59,45 @@ async function resolveVideo(link) {
   return { id, title: item.desc || `Video ${id}`, cover: v.cover?.url_list?.[0], options };
 }
 
+
+const DESKTOP_UA =
+  'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36';
+
+// Chạy trong trang web kênh: tự cuộn và gom ID video từ các thẻ <a href=".../video/ID">
+const INJECT = `
+(function(){
+  if (window.__dy) return; window.__dy = true;
+  var ids = {};
+  function post(list){ window.ReactNativeWebView.postMessage(JSON.stringify({type:'progress', data:list})); }
+  function scan(){
+    var a = document.querySelectorAll('a[href*="/video/"]');
+    for (var i=0;i<a.length;i++){
+      var h = a[i].getAttribute('href') || '';
+      var m = (h.split('/video/')[1] || '').match(/^[0-9]{8,}/);
+      if (m) ids[m[0]] = true;
+    }
+    return Object.keys(ids);
+  }
+  setInterval(function(){
+    post(scan());
+    window.scrollTo(0, 10000000);
+    if (document.documentElement) document.documentElement.scrollTop = 10000000;
+  }, 1200);
+})();
+true;
+`;
+
 export default function App() {
   const [text, setText] = useState('');
   const [items, setItems] = useState([]);
   const [history, setHistory] = useState([]);
   const [bulk, setBulk] = useState('720p');
   const [running, setRunning] = useState(false);
+  const [channelText, setChannelText] = useState('');
+  const [maxVideos, setMaxVideos] = useState('30');
+  const [chanUri, setChanUri] = useState(null);
+  const [collected, setCollected] = useState([]);
+  const doneRef = useRef(false);
 
   useEffect(() => {
     AsyncStorage.getItem('history').then((s) => s && setHistory(JSON.parse(s)));
@@ -77,21 +111,65 @@ export default function App() {
     if (t) setText((old) => (old ? old + '\n' + t : t));
   };
 
-  const addLinks = async () => {
-    const urls = [...new Set(text.match(/https?:\/\/[^\s\u4e00-\u9fff]+/g) || [])];
-    if (!urls.length) { Alert.alert('Lỗi', 'Không thấy link nào trong nội dung đã dán.'); return; }
-    setText('');
+  const enqueue = async (urls) => {
     const base = Date.now();
     const fresh = urls.map((u, n) => ({ key: `${base}_${n}`, link: u, status: 'fetching', progress: 0 }));
     setItems((prev) => [...fresh, ...prev]);
-    for (const it of fresh) {
+    for (let n = 0; n < fresh.length; n++) {
+      const it = fresh[n];
       try {
         const info = await resolveVideo(it.link);
         upd(it.key, { ...info, status: 'ready' });
       } catch (e) {
         upd(it.key, { status: 'error', error: e.message });
       }
+      if (fresh.length > 1) await new Promise((r) => setTimeout(r, 350));
     }
+  };
+
+  const addLinks = async () => {
+    const urls = [...new Set(text.match(/https?:\/\/[^\s\u4e00-\u9fff]+/g) || [])];
+    if (!urls.length) { Alert.alert('Lỗi', 'Không thấy link nào trong nội dung đã dán.'); return; }
+    setText('');
+    enqueue(urls);
+  };
+
+  const limit = () => Math.max(1, Math.min(200, parseInt(maxVideos, 10) || 30));
+
+  const openChannel = async () => {
+    const m = channelText.match(/https?:\/\/[^\s\u4e00-\u9fff]+/);
+    const raw = m ? m[0] : channelText.trim();
+    const pick = (s) => (s.match(/user\/([A-Za-z0-9_-]{20,})/) || [])[1] || (s.match(/sec_uid=([A-Za-z0-9_-]{20,})/) || [])[1];
+    let secUid = pick(raw) || (/^MS4w[A-Za-z0-9_-]+$/.test(raw) ? raw : null);
+    if (!secUid && m) {
+      try {
+        const r = await fetch(m[0], { headers: { 'User-Agent': UA } });
+        secUid = pick(r.url);
+      } catch (e) {}
+    }
+    if (!secUid) { Alert.alert('Lỗi', 'Không nhận ra link kênh. Hãy dán link chia sẻ trang cá nhân (kênh) Douyin.'); return; }
+    doneRef.current = false;
+    setCollected([]);
+    setChanUri(`https://www.douyin.com/user/${secUid}`);
+  };
+
+  const finishChannel = (ids) => {
+    if (doneRef.current) return;
+    if (!ids.length) { Alert.alert('Chưa gom được video nào', 'Đợi trang tải xong, hoặc xử lý captcha/đăng nhập trong khung rồi bấm Xong lại.'); return; }
+    doneRef.current = true;
+    setChanUri(null);
+    setChannelText('');
+    enqueue(ids.map((id) => `https://www.douyin.com/video/${id}`));
+  };
+
+  const onWebMsg = (e) => {
+    try {
+      const msg = JSON.parse(e.nativeEvent.data);
+      if (msg.type === 'progress') {
+        setCollected(msg.data);
+        if (msg.data.length >= limit()) finishChannel(msg.data.slice(0, limit()));
+      }
+    } catch (err) {}
   };
 
   const saveHistory = async (entry) => {
@@ -221,6 +299,27 @@ export default function App() {
           <TouchableOpacity style={[s.btn, { flex: 1 }]} onPress={addLinks}><Text style={s.btnT}>Thêm vào danh sách</Text></TouchableOpacity>
         </View>
 
+
+        <View style={s.bulk}>
+          <Text style={s.sub}>Tải cả kênh: dán link trang cá nhân (kênh) Douyin</Text>
+          <TextInput
+            style={[s.input, { minHeight: 0 }]}
+            placeholder="Link kênh (v.douyin.com/... hoặc douyin.com/user/...)"
+            placeholderTextColor="#777"
+            value={channelText}
+            onChangeText={setChannelText}
+          />
+          <View style={s.row}>
+            <View style={{ flex: 1 }}>
+              <Text style={s.sub}>Số video tối đa</Text>
+              <TextInput style={[s.input, { minHeight: 0 }]} value={maxVideos} onChangeText={setMaxVideos} keyboardType="numeric" />
+            </View>
+            <TouchableOpacity style={[s.btn, { flex: 2, justifyContent: 'center' }]} onPress={openChannel}>
+              <Text style={s.btnT}>Mở kênh & gom video</Text>
+            </TouchableOpacity>
+          </View>
+        </View>
+
         {items.length > 0 && (
           <View style={s.bulk}>
             <Text style={s.sub}>Tải tất cả với:</Text>
@@ -248,6 +347,34 @@ export default function App() {
           </View>
         ))}
       </ScrollView>
+
+      <Modal visible={!!chanUri} animationType="slide" onRequestClose={() => setChanUri(null)}>
+        <SafeAreaView style={[s.root, { padding: 0 }]}>
+          <View style={s.modalBar}>
+            <Text style={[s.btnT, { flex: 1 }]}>Đang gom: {collected.length}/{limit()} video</Text>
+            <TouchableOpacity style={s.btnAlt} onPress={() => setChanUri(null)}><Text style={s.btnT}>Đóng</Text></TouchableOpacity>
+            <TouchableOpacity style={[s.btn, { paddingVertical: 10, marginLeft: 8 }]} onPress={() => finishChannel(collected.slice(0, limit()))}>
+              <Text style={s.btnT}>Xong</Text>
+            </TouchableOpacity>
+          </View>
+          <Text style={[s.sub, { paddingHorizontal: 12 }]}>App tự cuộn trang. Nếu hiện captcha hoặc đăng nhập, xử lý ngay trong khung này.</Text>
+          {chanUri && (
+            <WebView
+              source={{ uri: chanUri }}
+              userAgent={DESKTOP_UA}
+              injectedJavaScript={INJECT}
+              onMessage={onWebMsg}
+              javaScriptEnabled
+              domStorageEnabled
+              thirdPartyCookiesEnabled
+              sharedCookiesEnabled
+              originWhitelist={['*']}
+              onShouldStartLoadWithRequest={(r) => /^https?:/i.test(r.url)}
+              style={{ flex: 1, backgroundColor: '#000' }}
+            />
+          )}
+        </SafeAreaView>
+      </Modal>
     </SafeAreaView>
   );
 }
@@ -276,6 +403,7 @@ const s = StyleSheet.create({
   barFill: { height: 8, backgroundColor: '#25f4ee', borderRadius: 4 },
   opts: { flexDirection: 'row', flexWrap: 'wrap', gap: 8, marginTop: 10 },
   opt: { backgroundColor: '#25f4ee22', borderColor: '#25f4ee', borderWidth: 1, paddingVertical: 8, paddingHorizontal: 14, borderRadius: 8 },
+  modalBar: { flexDirection: 'row', alignItems: 'center', padding: 12, paddingTop: Platform.OS === 'android' ? 40 : 12 },
   hi: { paddingVertical: 8, borderBottomColor: '#222', borderBottomWidth: 1 },
   hiT: { color: '#fff' },
 });
