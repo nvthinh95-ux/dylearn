@@ -63,23 +63,59 @@ async function resolveVideo(link) {
 const DESKTOP_UA =
   'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36';
 
-// Chạy trong trang web kênh: tự cuộn và gom ID video từ các thẻ <a href=".../video/ID">
-const INJECT = `
+// Chạy trong trang web kênh. Bắt dữ liệu API danh sách bài đăng của CHÍNH kênh này
+// (chỉ nhận video có author.sec_uid trùng kênh), rồi tự cuộn để tải thêm.
+const makeInject = (sec) => `
 (function(){
   if (window.__dy) return; window.__dy = true;
-  var ids = {};
-  function post(list){ window.ReactNativeWebView.postMessage(JSON.stringify({type:'progress', data:list})); }
-  function scan(){
-    var a = document.querySelectorAll('a[href*="/video/"]');
+  var TARGET = '${sec}';
+  var ids = {}, order = [], apiN = 0, domN = 0;
+  function post(){
+    window.ReactNativeWebView.postMessage(JSON.stringify({type:'progress', data:order, url:location.href, api:apiN, dom:domN}));
+  }
+  function take(json){
+    try{
+      var list = json && json.aweme_list; if(!list) return;
+      for (var i=0;i<list.length;i++){
+        var it = list[i]; var id = it && it.aweme_id; if(!id) continue;
+        var au = it.author && it.author.sec_uid;
+        if (au && au !== TARGET) continue;
+        if(!ids[id]){ ids[id]=1; order.push(String(id)); apiN++; }
+      }
+      post();
+    }catch(e){}
+  }
+  var of = window.fetch;
+  if (of) window.fetch = function(){
+    var args = arguments;
+    var u = (typeof args[0]==='string' ? args[0] : (args[0] && args[0].url)) || '';
+    var p = of.apply(this, args);
+    if (u.indexOf('aweme/post') > -1) {
+      p.then(function(r){ r.clone().json().then(take).catch(function(){}); }).catch(function(){});
+    }
+    return p;
+  };
+  var oo = XMLHttpRequest.prototype.open;
+  XMLHttpRequest.prototype.open = function(m,u){ this.__u = u; return oo.apply(this, arguments); };
+  var os = XMLHttpRequest.prototype.send;
+  XMLHttpRequest.prototype.send = function(){
+    var x = this;
+    x.addEventListener('load', function(){
+      try{ if ((x.__u||'').indexOf('aweme/post') > -1) take(JSON.parse(x.responseText)); }catch(e){}
+    });
+    return os.apply(this, arguments);
+  };
+  function scanDom(){
+    if (location.pathname.indexOf('/user/') !== 0) return;
+    var a = document.querySelectorAll('[data-e2e="scroll-list"] a[href*="/video/"], [data-e2e="user-post-list"] a[href*="/video/"]');
     for (var i=0;i<a.length;i++){
       var h = a[i].getAttribute('href') || '';
       var m = (h.split('/video/')[1] || '').match(/^[0-9]{8,}/);
-      if (m) ids[m[0]] = true;
+      if (m && !ids[m[0]]) { ids[m[0]] = 1; order.push(m[0]); domN++; }
     }
-    return Object.keys(ids);
   }
   setInterval(function(){
-    post(scan());
+    scanDom(); post();
     window.scrollTo(0, 10000000);
     if (document.documentElement) document.documentElement.scrollTop = 10000000;
   }, 1200);
@@ -96,6 +132,9 @@ export default function App() {
   const [channelText, setChannelText] = useState('');
   const [maxVideos, setMaxVideos] = useState('30');
   const [chanUri, setChanUri] = useState(null);
+  const [chanSec, setChanSec] = useState('');
+  const [chanInfo, setChanInfo] = useState('');
+  const [chanWarn, setChanWarn] = useState(false);
   const [collected, setCollected] = useState([]);
   const doneRef = useRef(false);
 
@@ -149,7 +188,8 @@ export default function App() {
     }
     if (!secUid) { Alert.alert('Lỗi', 'Không nhận ra link kênh. Hãy dán link chia sẻ trang cá nhân (kênh) Douyin.'); return; }
     doneRef.current = false;
-    setCollected([]);
+    setCollected([]); setChanInfo(''); setChanWarn(false);
+    setChanSec(secUid);
     setChanUri(`https://www.douyin.com/user/${secUid}`);
   };
 
@@ -167,6 +207,8 @@ export default function App() {
       const msg = JSON.parse(e.nativeEvent.data);
       if (msg.type === 'progress') {
         setCollected(msg.data);
+        setChanInfo(`API ${msg.api} · DOM ${msg.dom}`);
+        setChanWarn(!/\/user\//.test(msg.url || ''));
         if (msg.data.length >= limit()) finishChannel(msg.data.slice(0, limit()));
       }
     } catch (err) {}
@@ -357,12 +399,14 @@ export default function App() {
               <Text style={s.btnT}>Xong</Text>
             </TouchableOpacity>
           </View>
-          <Text style={[s.sub, { paddingHorizontal: 12 }]}>App tự cuộn trang. Nếu hiện captcha hoặc đăng nhập, xử lý ngay trong khung này.</Text>
+          <Text style={[s.sub, { paddingHorizontal: 12 }]}>App tự cuộn trang và chỉ nhận video đúng của kênh này. Nếu hiện captcha hoặc đăng nhập, xử lý ngay trong khung. {chanInfo}</Text>
+          {chanWarn && <Text style={[s.sub, { paddingHorizontal: 12, color: '#ff6b6b' }]}>Chưa vào được trang kênh (Douyin đã chuyển hướng). Hãy đăng nhập/qua captcha rồi mở lại.</Text>}
           {chanUri && (
             <WebView
               source={{ uri: chanUri }}
               userAgent={DESKTOP_UA}
-              injectedJavaScript={INJECT}
+              injectedJavaScriptBeforeContentLoaded={makeInject(chanSec)}
+              injectedJavaScript={makeInject(chanSec)}
               onMessage={onWebMsg}
               javaScriptEnabled
               domStorageEnabled
