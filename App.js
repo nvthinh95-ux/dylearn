@@ -17,6 +17,50 @@ const getId = (s) =>
   ((s || '').match(/video\/(\d{8,})/) || [])[1] ||
   ((s || '').match(/modal_id=(\d{8,})/) || [])[1];
 
+// Đọc header file MP4 thật để biết độ phân giải/codec (không tin nhãn)
+function findDims(buf) {
+  const tags = { avc1: 'h264', avc3: 'h264', hvc1: 'hevc', hev1: 'hevc', av01: 'av1' };
+  for (let i = 4; i < buf.length - 40; i++) {
+    const t = String.fromCharCode(buf[i], buf[i + 1], buf[i + 2], buf[i + 3]);
+    if (tags[t]) {
+      const w = (buf[i + 28] << 8) | buf[i + 29];
+      const h = (buf[i + 30] << 8) | buf[i + 31];
+      if (w >= 100 && w <= 8192 && h >= 100 && h <= 8192) return { w, h, codec: tags[t] };
+    }
+  }
+  return null;
+}
+
+async function ranged(url, range, ms = 9000) {
+  const ctl = new AbortController();
+  const timer = setTimeout(() => ctl.abort(), ms);
+  try {
+    const r = await fetch(url, { headers: { ...HEADERS, Range: range }, signal: ctl.signal });
+    if (r.status !== 200 && r.status !== 206) return null;
+    const cr = r.headers.get('content-range');
+    const total = cr ? parseInt(cr.split('/')[1], 10) : parseInt(r.headers.get('content-length') || '0', 10);
+    const buf = new Uint8Array(await r.arrayBuffer());
+    return { buf, total, finalUrl: r.url || url };
+  } catch (e) {
+    return null;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function probe(cand) {
+  const head = await ranged(cand.url, 'bytes=0-393215');
+  if (!head || head.buf.length < 16) return null;
+  const isMp4 = String.fromCharCode(head.buf[4], head.buf[5], head.buf[6], head.buf[7]) === 'ftyp';
+  if (!isMp4) return null;
+  let dims = findDims(head.buf);
+  if (!dims && head.total > 400000) {
+    const tail = await ranged(cand.url, `bytes=${Math.max(0, head.total - 393216)}-${head.total - 1}`);
+    if (tail) dims = findDims(tail.buf);
+  }
+  return { ...cand, size: head.total, real: !!dims, w: dims?.w || cand.w, h: dims?.h || cand.h, codec: dims?.codec || null };
+}
+
 async function resolveVideo(link) {
   let id = getId(link);
   if (!id) {
@@ -41,20 +85,48 @@ async function resolveVideo(link) {
   if (!item) throw new Error('Không tìm thấy video (có thể đã bị xóa).');
 
   const v = item.video;
-  const uri = v.play_addr.uri;
-  const fallback = (v.play_addr.url_list?.[0] || '').replace('/playwm/', '/play/');
-  const q = (ratio) =>
-    `https://aweme.snssdk.com/aweme/v1/play/?video_id=${uri}&ratio=${ratio}&line=0`;
+  const clean = (u) => (u || '').replace('/playwm/', '/play/');
+  const cands = [];
+  const add = (url, meta = {}) => {
+    if (url && !cands.find((c) => c.url === url)) cands.push({ url, ...meta });
+  };
+  const brs = v.bit_rate || [];
+  brs.forEach((b) => add(clean(b.play_addr?.url_list?.[0]), { w: b.play_addr?.width, h: b.play_addr?.height }));
+  ['play_addr', 'play_addr_h264', 'play_addr_265', 'play_addr_lowbr'].forEach((k) => {
+    const pa = v[k];
+    if (pa?.url_list?.[0]) add(clean(pa.url_list[0]), { w: pa.width, h: pa.height });
+  });
+  const uris = new Set(
+    [v.play_addr?.uri, v.play_addr_h264?.uri, v.play_addr_265?.uri, ...brs.map((b) => b.play_addr?.uri)].filter(Boolean)
+  );
+  uris.forEach((u) => {
+    ['1080p', '720p', '540p'].forEach((r) =>
+      add(`https://aweme.snssdk.com/aweme/v1/play/?video_id=${u}&ratio=${r}&line=0`));
+  });
 
-  const options = [
-    { label: '1080p', url: q('1080p'), fallback },
-    { label: '720p', url: q('720p'), fallback },
-    { label: '540p', url: q('540p'), fallback },
-    { label: 'Mặc định', url: fallback, fallback },
-  ];
+  const probed = (await Promise.all(cands.slice(0, 14).map(probe))).filter(Boolean);
+  if (!probed.length) throw new Error('Không kiểm tra được file video thật (bị chặn hoặc video riêng tư).');
+
+  // Gộp các bản trùng (cùng dung lượng = cùng một file)
+  const byKey = new Map();
+  probed.forEach((p) => {
+    const k = p.size > 0 ? String(p.size) : `${p.w}x${p.h}${p.codec}`;
+    const old = byKey.get(k);
+    if (!old || (!old.real && p.real)) byKey.set(k, p);
+  });
+  const resOf = (p) => (p.w && p.h ? Math.min(p.w, p.h) : 0);
+  const sorted = [...byKey.values()].sort((x, y) => resOf(y) - resOf(x) || y.size - x.size);
+  const options = sorted.map((p, i) => {
+    const res = resOf(p);
+    const mb = p.size > 0 ? ` · ${(p.size / 1048576).toFixed(1)} MB` : '';
+    const codec = p.codec === 'hevc' ? ' HEVC' : p.codec === 'av1' ? ' AV1' : '';
+    const text = (res ? `${res}p${codec}` : 'Chưa rõ độ phân giải') + mb;
+    return { key: `v${i}`, text, res, size: p.size, url: p.url, best: i === 0 };
+  });
+
   const pu = item.music?.play_url;
   const musicUrl = pu?.url_list?.[0] || (pu?.uri && pu.uri.startsWith('http') ? pu.uri : null);
-  if (musicUrl) options.push({ label: 'Nhạc', url: musicUrl, audio: true });
+  if (musicUrl) options.push({ key: 'audio', text: '♪ Nhạc', audio: true, url: musicUrl });
 
   return { id, title: item.desc || `Video ${id}`, cover: v.cover?.url_list?.[0], options };
 }
@@ -127,7 +199,7 @@ export default function App() {
   const [text, setText] = useState('');
   const [items, setItems] = useState([]);
   const [history, setHistory] = useState([]);
-  const [bulk, setBulk] = useState('720p');
+  const [bulk, setBulk] = useState('Cao nhất');
   const [running, setRunning] = useState(false);
   const [channelText, setChannelText] = useState('');
   const [maxVideos, setMaxVideos] = useState('30');
@@ -229,8 +301,8 @@ export default function App() {
       if (!perm.granted) throw new Error('Cần cấp quyền lưu vào thư viện.');
       const ext = opt.audio ? 'mp3' : 'mp4';
       const minSize = opt.audio ? 10 * 1024 : 50 * 1024;
-      const path = `${FileSystem.cacheDirectory}dy_${it.id}_${opt.label}.${ext}`;
-      upd(key, { status: 'downloading', progress: 0, mb: 0, label: opt.label, error: null });
+      const path = `${FileSystem.cacheDirectory}dy_${it.id}_${opt.key}.${ext}`;
+      upd(key, { status: 'downloading', progress: 0, mb: 0, label: opt.text, error: null });
 
       const attempt = async (url) => {
         let lastPct = -2;
@@ -249,18 +321,16 @@ export default function App() {
         if (r.status !== 200 || !info.exists || info.size < minSize) {
           throw new Error('Tải thất bại (' + r.status + ')');
         }
+        if (opt.size > 0 && info.size < opt.size * 0.9) {
+          throw new Error('File tải về thiếu dung lượng, thử lại.');
+        }
         return r.uri;
       };
 
-      let local;
-      try { local = await attempt(opt.url); }
-      catch (e) {
-        if (opt.audio || !opt.fallback) throw e;
-        local = await attempt(opt.fallback);
-      }
+      const local = await attempt(opt.url);
       await MediaLibrary.saveToLibraryAsync(local);
       upd(key, { status: 'done', progress: 100 });
-      saveHistory({ id: it.id + opt.label + Date.now(), title: it.title, label: opt.label, date: new Date().toLocaleString() });
+      saveHistory({ id: it.id + opt.key + Date.now(), title: it.title, label: opt.text, date: new Date().toLocaleString() });
     } catch (e) {
       upd(key, { status: 'error', error: e.message });
     }
@@ -271,9 +341,12 @@ export default function App() {
     if (!todo.length) { Alert.alert('Chưa có video nào sẵn sàng để tải.'); return; }
     setRunning(true);
     for (const it of todo) {
-      const opt = it.options.find((o) => o.label === bulk) ||
-        (bulk === 'Nhạc' ? null : it.options.find((o) => !o.audio));
-      if (!opt) { upd(it.key, { status: 'error', error: 'Video này không có nhạc riêng.' }); continue; }
+      const vids = it.options.filter((o) => !o.audio);
+      let opt = null;
+      if (bulk === 'Nhạc') opt = it.options.find((o) => o.audio) || null;
+      else if (bulk === 'Nhẹ nhất') opt = vids.reduce((m, o) => (!m || (o.size || 1e12) < (m.size || 1e12) ? o : m), null);
+      else opt = vids[0] || null;
+      if (!opt) { upd(it.key, { status: 'error', error: bulk === 'Nhạc' ? 'Video này không có nhạc riêng.' : 'Không có bản video tải được.' }); continue; }
       await downloadItem(it, opt);
     }
     setRunning(false);
@@ -285,8 +358,8 @@ export default function App() {
         {it.cover ? <Image source={{ uri: it.cover }} style={s.thumb} /> : <View style={[s.thumb, { backgroundColor: '#333' }]} />}
         <View style={{ flex: 1 }}>
           <Text style={s.title} numberOfLines={2}>{it.title || it.link}</Text>
-          {it.status === 'fetching' && <Text style={s.sub}>Đang lấy thông tin...</Text>}
-          {it.status === 'ready' && <Text style={s.sub}>Sẵn sàng, chọn chất lượng</Text>}
+          {it.status === 'fetching' && <Text style={s.sub}>Đang quét các bản video thật...</Text>}
+          {it.status === 'ready' && <Text style={s.sub}>Có {it.options.filter((o) => !o.audio).length} bản video thật. ★ = cao nhất</Text>}
           {it.status === 'done' && <Text style={[s.sub, { color: '#4cd964' }]}>Đã lưu ({it.label}) ✓</Text>}
           {it.status === 'error' && <Text style={[s.sub, { color: '#ff6b6b' }]}>Lỗi: {it.error}</Text>}
         </View>
@@ -309,8 +382,8 @@ export default function App() {
       {(it.status === 'ready' || it.status === 'done' || (it.status === 'error' && it.options)) && (
         <View style={s.opts}>
           {it.options.map((o) => (
-            <TouchableOpacity key={o.label} style={s.opt} onPress={() => downloadItem(it, o)} disabled={running}>
-              <Text style={s.btnT}>{o.audio ? '♪ Nhạc' : o.label}</Text>
+            <TouchableOpacity key={o.key} style={s.opt} onPress={() => downloadItem(it, o)} disabled={running}>
+              <Text style={s.btnT}>{o.best ? '★ ' : ''}{o.text}</Text>
             </TouchableOpacity>
           ))}
         </View>
@@ -318,7 +391,7 @@ export default function App() {
     </View>
   );
 
-  const labels = ['1080p', '720p', '540p', 'Mặc định', 'Nhạc'];
+  const labels = ['Cao nhất', 'Nhẹ nhất', 'Nhạc'];
 
   return (
     <SafeAreaView style={s.root}>
