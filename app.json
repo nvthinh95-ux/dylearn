@@ -1,24 +1,36 @@
 {
   "expo": {
-    "name": "DyLearn",
+    "name": "Adgen747",
     "slug": "dylearn",
-    "version": "1.0.0",
+    "version": "1.2.0",
     "orientation": "portrait",
     "userInterfaceStyle": "dark",
     "backgroundColor": "#000000",
     "android": {
       "package": "com.dylearn.app",
-      "versionCode": 1,
+      "versionCode": 3,
       "permissions": [
         "INTERNET",
         "READ_MEDIA_VIDEO",
         "READ_MEDIA_IMAGES",
         "WRITE_EXTERNAL_STORAGE",
-        "READ_EXTERNAL_STORAGE"
-      ]
+        "READ_EXTERNAL_STORAGE",
+        "READ_MEDIA_AUDIO"
+      ],
+      "adaptiveIcon": {
+        "foregroundImage": "./adaptive-icon.png",
+        "backgroundColor": "#07070B"
+      }
     },
     "plugins": [
-      ["expo-media-library", { "savePhotosPermission": "Cho phép lưu video đã tải vào thư viện.", "isAccessMediaLocationEnabled": false }]
-    ]
+      [
+        "expo-media-library",
+        {
+          "savePhotosPermission": "Cho phép lưu video đã tải vào thư viện.",
+          "isAccessMediaLocationEnabled": false
+        }
+      ]
+    ],
+    "icon": "./icon.png"
   }
 }
